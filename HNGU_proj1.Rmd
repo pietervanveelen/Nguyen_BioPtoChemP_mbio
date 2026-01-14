@@ -1,0 +1,911 @@
+---
+title: "HNGU_proj1"
+author: "Pieter van Veelen"
+date: "2025-02-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r library loading, message=F, echo=T, eval=T, warning=T, include=T, cache=F}
+
+## load required packages
+library(Hmisc)
+library(phyloseq)
+library(qiime2R)
+library(tidyverse)
+library(magrittr)
+library(devtools)
+library(qiime2R)
+library(here)
+library(breakaway)
+library(DivNet)
+library(openxlsx)
+library(ape)
+library(vegan)
+library(ggtext)
+library(cowplot)
+library(RColorBrewer)
+library(microbiome)
+library(lme4)
+library(lmerTest)
+library(decontam)
+library(ampvis2)
+library(glue)
+library(lubridate)
+library(DECIPHER)
+library(ensembleTax)
+#library(mEQO)
+library(ggh4x)
+#library(AICcPermanova)
+library(paletteer)
+```
+```{r SessionInfo}
+
+rm("output_data/*")
+rm("output_data/figures/*")
+
+sessionInfo()
+
+```
+
+```{r project organization, message=F, echo=T, eval=T, warning=F, include=T, cache=T}
+
+# project name
+proj = "HNGU_proj1"
+
+# create directories
+if(!dir.exists("figures")){dir.create("figures")}
+if(!dir.exists("output_data")){dir.create("output_data")} 
+if(!dir.exists("scripts")){dir.create("scripts")} 
+#if(!dir.exists("scripts/QIIME2")){dir.create("scripts/QIIME2")} 
+
+### create color vector for later use
+library(RColorBrewer)
+
+# define a color vector using brewer.pal and colorset
+colvec = c(brewer.pal(8,"Dark2"),brewer.pal(8,"Set2"),brewer.pal(8,"Accent"),brewer.pal(8,"Paired"),brewer.pal(12,"Set3"),brewer.pal(9,"Set1"))
+
+colorset <- c(
+  paletteer::paletteer_d("LaCroixColoR::Orange"),
+  paletteer::paletteer_d("yarrr::usualsuspects"),
+  paletteer::paletteer_d("lisa::OskarSchlemmer"),
+  paletteer::paletteer_d("PNWColors::Shuksan2"),
+  paletteer::paletteer_d("beyonce::X39"),
+  colvec
+)
+
+```
+
+```{r import data}
+
+asv_tab = read_tsv("input_data/Total relative abundance clean_pvee.txt")
+tax_tab = read.xlsx("input_data/tax_table.xlsx") %>% as_tibble()
+sam_dat = read.xlsx("input_data/sample_data.xlsx", detectDates = TRUE) %>% as_tibble()
+env_data_raw = read.xlsx("input_data/BioP-fixed.xlsx", sheet = 2, detectDates = TRUE) %>% 
+  as_tibble() %>% janitor::clean_names() %>% 
+  mutate(date = lubridate::dmy(date))
+interpolated_Fe = read.xlsx("input_data/interpolated_data.xlsx", detectDates = TRUE) %>% as_tibble()
+
+# environmental factors
+env_data_filt = 
+  env_data_raw %>% 
+  filter(date %in% sam_dat$date) %>% 
+  arrange(date) %>% 
+  inner_join(., sam_dat, by = "date", multiple = "first") %>% 
+  select(sampleID, everything()) 
+
+# add env data for sample 27
+env_data_filt_s27 = 
+  env_data_filt %>% filter(sampleID == "sample26") %>% 
+  mutate(sampleID = "sample27")
+
+env_data2 = 
+  bind_rows(env_data_filt, env_data_filt_s27)
+
+# import additional tank temperature data
+tank_temp = 
+  openxlsx::read.xlsx("input_data/new tank temperature.xlsx", detectDates = T) %>% 
+    as_tibble() %>% 
+    janitor::clean_names() %>% 
+    rename(date_tank_temperature_data = "date",
+           temperature_in_niitrification_tank_1 = "temp_tank")
+
+# add temp_tank to env_data
+env_data = 
+inner_join(env_data2[-4], interpolated_Fe, by = c("date" = "Date")) %>% 
+  left_join(., tank_temp, by = "date") %>% 
+  select(sampleID, date, temp_tank, `Total.Fe.(g/kg.TS).Secondary.sludge.V08`, everything())
+
+# check correlation temp_tank and tavg
+env_data %>% 
+  ggplot(aes(x = tavg, y = temp_tank)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F)
+
+# physeq otu_table
+ps_otus = otu_table(data.frame(asv_tab)[,-1], taxa_are_rows = TRUE)
+sample_names(ps_otus) = colnames(asv_tab)[-1]
+taxa_names(ps_otus) = data.frame(asv_tab)[,1]
+
+# physeq tax_table
+ps_tax = tax_table(as.matrix(tax_tab[,-1]))
+taxa_names(ps_tax) = data.frame(asv_tab)[,1]
+
+# physeq sam_dat
+ps_samdat = sample_data(data.frame(sam_dat))
+sample_names(ps_samdat) = ps_samdat$sampleID
+
+# compile physeq
+physeq = phyloseq(ps_otus, ps_tax, ps_samdat)
+
+
+## import physeq from qiime2
+physeq2 = 
+qiime2R::qza_to_phyloseq(features = "input_data/QIIME2_output/featureTable.qza",
+                         taxonomy = "input_data/QIIME2_output/seq_taxonomy.qza",
+                         tree = "input_data/QIIME2_output/rooted-tree.qza"
+                         #metadata = "input_data/sample_data.xlsx"
+                          ) 
+
+# add metadata and match sample names from otu_table
+sam_dat_physeq2 = 
+physeq2 %>% 
+  otu_table(.) %>% colnames() %>% as_tibble() %>% filter(grepl("HA.", value)) %>% 
+  mutate(date = str_remove(string = value, pattern = "HA."),
+         date = lubridate::dmy(date, quiet = T)) %>% 
+  inner_join(., sam_dat, by = "date") %>% 
+  sample_data() 
+
+
+# adjust duplicated sample name at last sampling date
+sam_dat_physeq2$value[27] = paste0(sam_dat_physeq2$value[27],"2")
+sample_names(sam_dat_physeq2) = sam_dat_physeq2$value
+
+# add metadata to physeq2
+physeq2 = phyloseq(otu_table(physeq2), tax_table(physeq2), sam_dat_physeq2)
+sample_names(physeq2) = sam_dat_physeq2$sampleID
+
+```
+
+<!-- ```{bash, eval=F} -->
+
+<!-- cp -R /Users/pvee/Wetsus_Projects/ELLY/ELLY_proj2_HGT_ozonation/data_analysis/scripts ./  -->
+
+<!-- ``` -->
+
+
+```{r tax_clean and filter taxa}
+
+## remove all mitochondria and chloroplasts, and all ASVs without Kingdom or Phylum assigned
+source("scripts/tax_clean_updated.R")
+physeq_clean = tax_clean(physeq) # 155 removed
+physeq2_clean = tax_clean(physeq2) # 392 removed
+
+# 155 ASVs removed
+removed_asvs = setdiff(taxa_names(physeq), taxa_names(physeq_clean))
+removed2_asvs = setdiff(taxa_names(physeq2), taxa_names(physeq2_clean))
+
+# view removed ASVs
+# physeq %>% 
+#   prune_taxa(taxa_names(.) %in% removed_asvs, .) %>% 
+#   tax_table() 
+# 
+# physeq2 %>% 
+#   prune_taxa(taxa_names(.) %in% removed2_asvs, .) %>% 
+#   tax_table() 
+
+# check cleaned tax table
+#physeq_clean %>% tax_table() %>% head(n=100) %>% view
+#physeq2_clean %>% tax_table() %>% head(n=100) %>% view
+#physeq2_clean %>% sample_sums()
+
+```
+
+```{r filter core taxa}
+
+# rel abund physeq1
+physeq_core50prev_0.01abund = 
+  physeq2_clean %>% 
+  transform_sample_counts(., function(x) x*100) %>%
+  microbiome::core(detection = 0.01, prevalence = 0.5)
+
+# abs abund physeq2
+physeq2_core50prev_0.01abund = 
+  physeq2_clean %>% 
+  #transform_sample_counts(., function(x) x*100) %>%
+  microbiome::core(detection = 0.01, prevalence = 0.5)
+
+```
+
+```{r genus level tax glom}
+
+# genus core
+physeq_core50prev_0.01abund_genus = 
+  tax_glom(physeq_core50prev_0.01abund, taxrank =  "Genus")
+
+physeq2_core50prev_0.01abund_genus = 
+  tax_glom(physeq2_core50prev_0.01abund, taxrank =  "Genus")
+
+
+# clr transform counts
+physeq2_core50prev_0.01abund_genus_clr = microbiome::transform(physeq2_core50prev_0.01abund_genus, transform = "clr")
+
+
+# psmelt genus core
+psmelt_genus_core = 
+  psmelt(physeq_core50prev_0.01abund_genus)
+
+psmelt2_genus_core = 
+  psmelt(physeq2_core50prev_0.01abund_genus)
+
+psmelt2_genus_core_clr = 
+  psmelt(physeq2_core50prev_0.01abund_genus_clr)
+
+
+```
+
+```{r plot_bar all genera, echo=T, fig.width=12, fig.height=9}
+
+#ps_Genus_rare_rel
+
+# count n genera n = 217
+psmelt_genus_core %>% 
+  as_tibble() %>% 
+  mutate(Genus = factor(Genus)) %>% 
+  pull(Genus) %>% 
+  levels() %>% 
+  length()
+
+# Define a function to find the first non-matching column
+
+# Use rowwise and mutate to apply the function
+ps_Genus_taxlabel = psmelt_genus_core %>% 
+  as_tibble() %>% 
+  mutate(across(everything(),  ~str_replace_all(., ",", "."))) %>% 
+  mutate(across(where(~ all(grepl("^-?\\d*\\.?\\d*$", .))), as.numeric)) %>% 
+  select(Sample, Abundance, date:Genus) %>%
+  rowwise() %>%
+  mutate(tax_label = case_when(
+    grepl("\\d", Genus) ~ {
+      first_non_numeric <- case_when(
+        !grepl("\\d", Family) ~ paste(Family, Genus, sep = " "),
+        !grepl("\\d", Order) ~ paste(Order, Genus, sep = " "),
+        !grepl("\\d", Class) ~ paste(Class, Genus, sep = " "),
+        !grepl("\\d", Phylum) ~ paste(Phylum, Genus, sep = " "),
+        !grepl("\\d", Kingdom) ~ paste(Kingdom, Genus, sep = " "),
+        TRUE ~ NA_character_
+      )
+      first_non_numeric
+    },
+    TRUE ~ Genus
+  ))
+
+Genus_abundances <- 
+  ps_Genus_taxlabel %>% 
+  #mutate(Sample_nr = str_sub(Sample, start = 1, end = 2)) %>% 
+  group_by_at(vars(Sample, date, tax_label)) %>% 
+  summarise(rel_abund = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>% 
+  mutate(mean_rel_abund = rel_abund/sum(rel_abund)*100) %>% 
+  ungroup() %>% 
+  group_by(Sample, date, tax_label) %>% 
+  mutate(tax_label = str_replace(tax_label, "(.*)_unclassified", "Unclassified *\\1*"),
+         tax_label = str_replace(tax_label, "^(\\S*)$", "*\\1*"))
+
+# Reduce genera to lower number (at least 3%, or else called other)
+Genus_pool <- Genus_abundances %>% 
+  group_by(tax_label) %>% 
+  summarise(pool = max(mean_rel_abund) < 1, 
+            mean = mean(mean_rel_abund), 
+            .groups = "drop")
+
+# name the taxon colors
+inner_join(Genus_abundances, Genus_pool, by="tax_label") %>% 
+  mutate(tax_label = if_else(pool, "Other max.<3%", tax_label)) %>% 
+  group_by(tax_label) %>%
+  summarise(mean_rel_abund = sum(mean_rel_abund), 
+            median = median(mean),
+            .groups = "drop") %>% 
+  mutate(tax_label = factor(tax_label), 
+         tax_label = fct_reorder(tax_label, median, .desc = T)) %>% 
+  arrange(desc(median)) %>% pull(tax_label) %>% unique() -> names(colorset)
+
+colorset["Other max.<1%"] <- "#D3D3D3"
+
+# reshape plot data
+plot_data <-
+inner_join(Genus_abundances, Genus_pool, by="tax_label") %>% 
+  mutate(tax_label = if_else(pool, "Other max.<1%", tax_label)) %>% 
+  # mutate(Sample = if_else(grepl(".*[^0-9][0-9]{2}$", Sample),
+  #                          Sample,
+  #                          str_c(str_sub(Sample, end = -2),"0", str_sub(Sample, -1)))) %>% 
+  group_by(Sample, date, tax_label) %>%
+  summarise(mean_rel_abund = sum(mean_rel_abund), 
+            mean = min(mean),
+            .groups = "drop") %>% 
+  mutate(Sample  = factor(Sample, levels = c(paste0("sample", seq(1:length(unique(psmelt_genus_core$Sample))))))) %>% 
+  mutate(tax_label = factor(tax_label), 
+         tax_label = fct_reorder(tax_label, mean, .desc = T)
+         )
+
+plot_data %>% 
+  write_csv(glue::glue("output_data/{proj}_relative_genus_abundances_prev50_1pct.csv", col_names = T, append = F))
+
+
+# plot the data per sample
+# plot function
+create_barplot <- 
+  function(data, colorset, date) {
+  ggplot(data, aes(x = Sample, y = mean_rel_abund, fill = tax_label)) +
+    geom_col() +
+    scale_fill_manual(name = "Genus", values = colorset) + 
+    scale_y_continuous(expand = c(0, 0), breaks = seq(0, 100, 10)) +
+    #scale_x_discrete(labels = PMA_label) +
+    labs(x = NULL, y = "Abundance (%)") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 0, size = 10, hjust = 0.5, vjust = 1),
+          axis.ticks.x = element_blank(),
+          legend.text = element_markdown(),
+          legend.key.size = unit(7, "pt"),
+          legend.position = "right",
+          strip.background = element_rect(colour = "white"),
+          strip.text = element_text(face = "bold")) +
+    guides(fill = guide_legend(nrow = 14)) #+
+    # facet_nested(cols = vars(dna_type, sample_type, exp_id), 
+    #              labeller = labeller(dna_type = dna_type_label, sample_type = sample_type_label),
+    #              scales = "free_x", space = "free_x",
+    #              nest_line = element_line(lineend = "round"), 
+    #              resect = unit(2, "mm"))
+  }
+
+# Apply the plotting function to each nested data frame
+plots <- 
+  create_barplot(plot_data, colorset, date) + 
+  scale_x_discrete(labels = setNames(plot_data$date, plot_data$Sample)) +  
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        legend.position = "bottom")
+
+
+ggsave(plot = plots, filename = glue("figures/{proj}_plot_barplot_genus_core50prev_0.01abund.pdf"), width = 13, height =8)
+
+```
+
+```{r beta diversity, echo=F}
+physeq_core50prev_0.01abund_genus
+
+# samples that also have the required metadata (V08):
+# sample_subset = 
+#   env_data %>% 
+#   mutate(across(is.numeric, ~scale(.x, center = T, scale = T))) %>% 
+#   select(sampleID, date, tavg, total_fe_g_kg_ts_secondary_sludge_v08) %>% 
+#   filter(!is.na(total_fe_g_kg_ts_secondary_sludge_v08)) %>% 
+#   pull(sampleID)
+
+# subset samples
+# physeq_core50prev_0.01abund_genus_noNA_metadata = 
+# physeq_core50prev_0.01abund_genus %>% 
+#   subset_samples(sampleID %in% sample_subset) %>% 
+#   prune_taxa(taxa_sums(.)>0,.)
+
+# ordination
+PCoA_BC <- ordinate(physeq_core50prev_0.01abund_genus, method = "PCoA", distance = "bray")
+
+# Extract eigenvalues
+eigenvalues <- PCoA_BC$values$Relative_eig
+
+# percent explained labeling
+pretty_pe <- format(round(eigenvalues[1:2]*100, digits = 1), nsmall =1, trim=T)
+
+# axis labels 
+labs <- c(glue("PCoA 1 ({pretty_pe[1]}%)"),
+          glue("PCoA 2 ({pretty_pe[2]}%)"))
+
+plot_data_biplot = 
+  plot_ordination(physeq = physeq_core50prev_0.01abund_genus, 
+                  ordination = PCoA_BC, 
+                  type = "biplot", 
+                  axes = c(1,2),
+                  justDF = T
+                  ) %>% 
+  as_tibble(rownames="Sample") %>%
+  mutate(functional_group = 
+           case_when(
+             grepl("Accumulibacter|Tetrasphaera|Dechloromonas",Genus) ~ "PAO",
+             grepl("Leptothrix|Sphaerotilus|Aquabacterium|Acidovorax|Ferritrophicum|Rhodobacter",Genus) ~ "IOB",
+             grepl("Competibacter|Contendobacter|Defluviicoccus",Genus) ~ "GAO",
+             grepl("Rhodoferax|Aeromonas|Geothrix|Pseudomonas|^Bacillus|Mucispirillum|Acidiphilium|Anaeromyxobacter|Serratia",Genus) ~ "DIRB",
+             grepl("Thiobacillus",Genus) ~ "IOB/DIRB",
+             TRUE ~ "other"))
+
+
+# plot PCoA ordination
+plot_PCoA_BC <- 
+plot_data_biplot %>% 
+  ggplot(aes(x=Axis.1, y=Axis.2)) +
+  geom_point(data = plot_data_biplot %>% filter(id.type == "Samples"),
+             aes(fill = date), size=3, shape = 21, color = "black", show.legend = T) +
+  geom_point(data = plot_data_biplot %>% filter(id.type == "Taxa"), 
+             aes(color = functional_group, shape = functional_group),size=2, show.legend = T) +
+  #ggrepel::geom_text_repel(aes(label = PMA), size = 2, min.segment.length = 1) +
+  #scale_color_manual(values = brewer.pal(6, "Dark2")) +
+  #scale_shape_manual(values = c(21, 22)) +
+  theme_minimal() +
+  labs(x = labs[1], y = labs[2]) +
+  #scale_fill_gradient(low = "darkred", high = "darkblue") +
+  ggtitle(glue::glue("PCoA ordination Genus-level Bray-Curtis dissimilarity")) +
+theme(
+  plot.title = element_text(hjust = 0, vjust = 0.5),
+  panel.background = element_rect(fill='transparent'),
+  panel.grid = element_blank(),
+  strip.text.y = element_text(face = "bold", angle = 90),
+  strip.text = element_text(face = "bold"),
+  panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.3),
+  axis.line.x = element_line(color="black", size = 0.3),
+  axis.line.y = element_line(color="black", size = 0.3)) 
+
+# save PCoA beta diversity
+plot_PCoA_BC 
+
+filtered_data <- plot_data_biplot %>% 
+  filter(id.type == "Samples" | (id.type == "Taxa" & functional_group != "other"))
+
+plot_PCoA_BC <- 
+  filtered_data %>% 
+  ggplot(aes(x = Axis.1, y = Axis.2)) +
+  geom_hline(aes(yintercept = 0), color = "grey", alpha = 0.5) +
+  geom_vline(aes(xintercept = 0), color = "grey", alpha = 0.5) +
+  geom_point(data = plot_data_biplot %>% filter(id.type == "Samples"),
+             aes(fill = date), size=3, shape = 21, color = "black", show.legend = T) +
+  geom_point(data = plot_data_biplot %>% filter((id.type == "Taxa" & functional_group != "other")), 
+             aes(color = functional_group, shape = functional_group),size=2, show.legend = T) +
+  theme_minimal() +
+  labs(x = labs[1], y = labs[2]) +
+  #scale_fill_gradient(low = "darkred", high = "darkblue") +
+  scale_color_manual(values = brewer.pal(6, "Dark2")) +
+  ggtitle(glue::glue("PCoA ordination Genus-level Bray-Curtis dissimilarity")) +
+  theme(
+    plot.title = element_text(hjust = 0, vjust = 0.5),
+    panel.background = element_rect(fill='transparent'),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(face = "bold", angle = 90),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.3),
+    axis.line.x = element_line(color="black", size = 0.3),
+    axis.line.y = element_line(color="black", size = 0.3)) +
+  ggrepel::geom_text_repel(aes(label = Genus, color = functional_group), size = 2)
+
+print(plot_PCoA_BC)
+
+ggsave(plot = plot_PCoA_BC, filename = glue("figures/{proj}_plot_beta_diversity_genus_BC.pdf"), width = 8, height =5)
+```
+
+
+```{r beta diversity aitchison clr, fig.width=14, fig.height=5}
+
+
+physeq2_core50prev_0.01abund_genus_clr
+
+# ordinate Aitchison (Euclidean PCoA on clr-transformed counts)
+PCoA_Ait_clr <-  ordinate(physeq2_core50prev_0.01abund_genus_clr, method = "PCoA", distance = "euclidean")
+
+# Extract eigenvalues
+eigenvalues_clr <- PCoA_Ait_clr$values$Relative_eig
+
+# percent explained labeling
+pretty_pe_clr <- format(round(eigenvalues_clr[1:2]*100, digits = 1), nsmall =1, trim=T)
+
+# axis labels 
+labs_clr <- c(glue("PCoA 1 ({pretty_pe_clr[1]}%)"),
+              glue("PCoA 2 ({pretty_pe_clr[2]}%)"))
+
+plot_data_biplot_clr = 
+  plot_ordination(physeq = physeq2_core50prev_0.01abund_genus_clr, 
+                  ordination = PCoA_Ait_clr, 
+                  type = "samples", 
+                  axes = c(1,2),
+                  justDF = T
+                  ) %>% 
+  as_tibble(rownames="Sample") #%>%
+  # mutate(functional_group = 
+  #          case_when(
+  #            grepl("Accumulibacter|Tetrasphaera|Dechloromonas",Genus) ~ "PAO",
+  #            grepl("Leptothrix|Sphaerotilus|Aquabacterium|Acidovorax|Ferritrophicum|Rhodobacter",Genus) ~ "IOB",
+  #            grepl("Competibacter|Contendobacter|Defluviicoccus",Genus) ~ "GAO",
+  #            grepl("Rhodoferax|Aeromonas|Geothrix|Pseudomonas|^Bacillus|Mucispirillum|Acidiphilium|Anaeromyxobacter|Serratia",Genus) ~ "DIRB",
+  #            grepl("Thiobacillus",Genus) ~ "IOB/DIRB",
+  #            TRUE ~ "other"))
+
+brk <- pretty(plot_data_biplot_clr$date)
+
+# plot PCoA ordination
+plot_PCoA_Aitchison <- 
+plot_data_biplot_clr %>% 
+  ggplot(aes(x=Axis.1, y=Axis.2)) +
+  geom_point(aes(fill = date), size=3, shape = 21, color = "black", show.legend = T) +
+  # geom_point(data = plot_data_biplot %>% filter(id.type == "Taxa"), 
+  #            aes(color = functional_group, shape = functional_group),size=2, show.legend = T) +
+  #ggrepel::geom_text_repel(aes(label = PMA), size = 2, min.segment.length = 1) +
+  #scale_fill_gradient() +
+  scale_fill_gradient2(trans = "date", mid = "purple",low = "blue", high = "red",
+                        midpoint = as.numeric(mean(plot_data_biplot_clr$date)),
+                        breaks = brk, labels = lubridate::as_date(brk)) +
+  #scale_shape_manual(values = c(21, 22)) +
+  theme_minimal() +
+  labs(x = labs_clr[1], y = labs_clr[2]) +
+  #scale_fill_gradient(low = "darkred", high = "darkblue") +
+  ggtitle(glue::glue("PCoA ordination Genus-level Aitchison distance")) +
+theme(
+  plot.title = element_text(hjust = 0, vjust = 0.5, size = 12),
+  panel.background = element_rect(fill='transparent'),
+  panel.grid = element_blank(),
+  strip.text.y = element_text(face = "bold", angle = 90),
+  strip.text = element_text(face = "bold"),
+  panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.3),
+  axis.line.x = element_line(color="black", size = 0.3),
+  axis.line.y = element_line(color="black", size = 0.3)) 
+
+# save PCoA beta diversity
+plot_PCoA_Aitchison 
+patchwork::wrap_plots(plot_PCoA_Aitchison, plot_PCoA_BC  + theme(plot.title = element_text(hjust = 0, vjust = 0.5, size = 12)), 
+                      ncol = 3,widths = c(6, 6))
+ggsave(plot = plot_PCoA_Aitchison, filename = glue("figures/{proj}_plot_beta_diversity_genus_Aitchison_clr.pdf"), width = 8, height =5)
+
+```
+```{r save clr table}
+
+physeq2_core50prev_0.01abund_genus_clr %>% 
+  psmelt() %>% 
+  as_tibble() %>% 
+  select(sampleID, date, Kingdom:Genus, Abundance) %>% 
+  select(-date) %>% 
+  pivot_wider(names_from = sampleID, values_from = Abundance, values_fill = 0) %>% 
+  write_csv("output_data/clr_transformed_genus_counts_per_sampleID.csv")
+
+physeq2_core50prev_0.01abund_genus_clr %>% 
+  psmelt() %>% 
+  as_tibble() %>% 
+  select(sampleID, date) %>% 
+  distinct() %>% 
+  arrange(date) %>% 
+  write_csv("output_data/sampleID_date_links.csv")
+```
+
+```{r env_fit to PCoA}
+
+# Compute the environmental fit
+env_data_scaled = 
+  env_data %>% 
+  janitor::clean_names() %>% 
+  mutate(across(where(is.numeric), ~scale(.x, center = T, scale = T))) %>% 
+  select(sample_id, date, temp_tank, total_fe_g_kg_ts_secondary_sludge_v08) %>% 
+  #filter(!is.na(total_fe_g_kg_ts_secondary_sludge_v08))
+  select(where(~ !any(is.na(.)))) # remove variables/columns containing NAs
+  
+envfit_results <- envfit(PCoA_BC$vectors, env_data_scaled[, 3:ncol(env_data_scaled)], permutations = 999)
+
+
+# plot BC with discrete colours for date
+plot_PCoA_BC_discrete = 
+  filtered_data %>% 
+  ggplot(aes(x = Axis.1, y = Axis.2)) +
+  geom_hline(aes(yintercept = 0), color = "grey", alpha = 0.5) +
+  geom_vline(aes(xintercept = 0), color = "grey", alpha = 0.5) +
+  geom_point(data = plot_data_biplot %>% filter(id.type == "Samples"),
+             aes(fill = date), size=3, shape = 21, color = "black", show.legend = T) +
+  geom_point(data = plot_data_biplot %>% filter((id.type == "Taxa" & functional_group != "other")), 
+             aes(color = functional_group, shape = functional_group),size=2, show.legend = T) +
+  theme_minimal() +
+  labs(x = labs[1], y = labs[2]) +
+  #scale_fill_gradient(low = "darkred", high = "darkblue") +
+  #scale_color_manual(values = brewer.pal(6, "Dark2")) +
+  ggtitle(glue::glue("PCoA ordination Genus-level Bray-Curtis dissimilarity")) +
+  theme(
+    plot.title = element_text(hjust = 0, vjust = 0.5),
+    panel.background = element_rect(fill='transparent'),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(face = "bold", angle = 90),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.3),
+    axis.line.x = element_line(color="black", size = 0.3),
+    axis.line.y = element_line(color="black", size = 0.3)) +
+  ggrepel::geom_text_repel(aes(label = as.character(date)), color = "black", size = 2) +
+  ggrepel::geom_text_repel(aes(label = Genus, color = functional_group), size = 2)
+
+
+# plot + env fit results (vectors scaled x0.3)
+plot_PCoA_BC_envfit = 
+plot_PCoA_BC_discrete +
+  geom_segment(data = as.data.frame(scores(envfit_results, display = "vectors")),
+               aes(x = 0, xend = Axis.1 *0.3, y = 0, yend = Axis.2*0.3),
+               arrow = arrow(length = unit(0.1, "cm")), color = "darkred") +
+  ggrepel::geom_text_repel(data = as.data.frame(scores(envfit_results, display = "vectors")),
+            aes(x = Axis.1*0.3, y = Axis.2*0.3, label = rownames(as.data.frame(scores(envfit_results, display = "vectors")))), color = "darkred", hjust = 1, vjust = 0.5, size = 3) 
+
+print(plot_PCoA_BC_envfit)
+
+# save PCoA + env fit
+ggsave(plot = plot_PCoA_BC_envfit, filename = glue("figures/{proj}_plot_PCoA_genus_BC_envfit_Fe.pdf"), width = 8, height =5)
+
+
+```
+```{r capscale plot prev50 abun0.01, eval=T, echo=T}
+
+bc_dist = vegdist(t(otu_table(physeq_core50prev_0.01abund_genus)), method = "bray")
+#cap = capscale(bc_dist ~ temp_tank + total_fe_g_kg_ts_secondary_sludge_v08 + Condition(date), data = env_data_scaled, distance = "bray")
+cap = capscale(bc_dist ~ temp_tank + total_fe_g_kg_ts_secondary_sludge_v08, data = env_data_scaled, distance = "bray")
+
+# test for marginal effects of tank temperature and Fe concentration.
+# this significance is tested for the additive effect of the term, accounting for variance explained by all remaining terms
+# this constrained ordination using capscale performs redundancy analysis on a non-Euclidean distance
+anova(cap, by = "margin")
+anova.cca(cap)
+RsquareAdj(cap)
+
+# save output stats
+broom::tidy(anova.cca(cap)) %>% 
+  write_csv(glue::glue("output_data/{proj}_permutational_ANOVA_capscale_global.csv"))
+
+broom::tidy(anova(cap, by = "margin")) %>% 
+  write_csv(glue::glue("output_data/{proj}_permutational_ANOVA_capscale_marginal_effects.csv"))
+
+
+library(vegan)
+library(tidyverse)
+library(ggrepel)
+library(glue)
+library(ggh4x)
+# -----------------------------
+# 1. Extract ordination scores
+# -----------------------------
+
+# env_data_scaled2 = 
+#   env_data_scaled %>% 
+#   mutate(day = as.numeric(difftime(date, "2022-04-05", units = "days"))) %>% 
+#   mutate(day_scaled = scale(day, center = T, scale = T)) %>% 
+#   select(-date, -day)
+# cap = capscale(t(otu_table(physeq_core50prev_0.01abund_genus)) ~ tavg + total_fe_g_kg_ts_secondary_sludge_v08, data = env_data_scaled2, distance = "bray")
+cap_scores <- scores(cap, display = c("sites", "species", "bp"), scaling = 1)
+
+# Sites (sample scores)
+sites_df <- as.data.frame(cap_scores$sites) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(env_data_scaled, by = "sample_id")  # join metadata
+
+# Species (taxa) scores
+# 1. Extract species scores from capscale
+species_df <- as.data.frame(scores(cap, display = "species", scaling = 1)) %>%
+  rownames_to_column("ASV") %>% 
+  inner_join(., 
+             tax_table(physeq_core50prev_0.01abund_genus) %>% data.frame() %>% as_tibble(rownames = "ASV"),
+             by = "ASV")
+
+# 2. Add functional_group based on your rules
+species_df <- species_df %>%
+  mutate(functional_group = case_when(
+    grepl("Accumulibacter|Tetrasphaera|Dechloromonas", Genus) ~ "PAO",
+    grepl("Leptothrix|Sphaerotilus|Aquabacterium|Acidovorax|Ferritrophicum|Rhodobacter", Genus) ~ "IOB",
+    grepl("Competibacter|Contendobacter|Defluviicoccus", Genus) ~ "GAO",
+    grepl("Rhodoferax|Aeromonas|Geothrix|Pseudomonas|^Bacillus|Mucispirillum|Acidiphilium|Anaeromyxobacter|Serratia", Genus) ~ "DIRB",
+    grepl("Thiobacillus", Genus) ~ "IOB/DIRB",
+    TRUE ~ "other"
+  ))
+
+
+# Environmental vectors
+env_df <- as.data.frame(cap_scores$biplot) %>%
+  rownames_to_column("variable")
+
+# Explained variance
+eig <- eigenvals(cap)
+proportion_explained_axis1 <- 
+  t(summary(eig)) %>% as_tibble(rownames = "Axis") %>% 
+  filter(Axis == "CAP1") %>% 
+  janitor::clean_names() %>% 
+  select(proportion_explained) %>% 
+  unlist() %>% 
+  unique() 
+percent_explained_axis1 = 
+  round(proportion_explained_axis1 * 100, digits = 1)
+
+proportion_explained_axis2 <-
+  t(summary(eig)) %>% as_tibble(rownames = "Axis") %>% 
+  filter(Axis == "CAP2") %>% 
+  janitor::clean_names() %>% 
+  select(cumulative_proportion) %>% 
+  unlist() %>% 
+  unique() 
+proportion_explained_axis3 <-
+  t(summary(eig)) %>% as_tibble(rownames = "Axis") %>% 
+  filter(Axis == "CAP3") %>% 
+  janitor::clean_names() %>% 
+  select(cumulative_proportion) %>% 
+  unlist() %>% 
+  unique() 
+
+percent_explained_axis2 = 
+  round(((proportion_explained_axis2 - proportion_explained_axis1) * 100), digits = 1)
+percent_explained_axis3 = 
+  round(((proportion_explained_axis3-proportion_explained_axis2) * 100 ), digits = 1)
+  
+axis1_label <- glue("CAP1 ({percent_explained_axis1}%)")
+axis2_label <- glue("CAP2 ({percent_explained_axis2}%)")
+axis3_label <- glue("CAP3 ({percent_explained_axis3}%)")
+
+# Run anova.cca to determine significantly and strongly correlated species
+anova_global <-  anova.cca(cap, parallel = getOption("mc.cores"))
+
+# Run anova.cca to determine significantly and strongly correlated species
+anova_result <-  anova.cca(cap, by = "terms", parallel = getOption("mc.cores"))
+
+# save anova
+anova_global %>% broom::tidy() %>% as_tibble() %>% 
+  write_csv("output_data/capscale_dbRDA_bray_anova_global.csv", col_names = T)
+
+anova_result %>% broom::tidy() %>% as_tibble() %>% 
+  write_csv("output_data/capscale_dbRDA_bray_anova_result.csv", col_names = T)
+
+library(tidyverse)
+
+# Extract species and biplot scores
+species_scores <- scores(cap, display = "species", scaling = 1)
+env_vectors <- scores(cap, display = "bp", scaling = 1)
+
+# significant variables
+significant_vars = 
+anova_result %>% broom::tidy() %>% as_tibble() %>% 
+  filter(p.value < 0.05) %>% 
+  pull(term)
+
+# Initialize an empty list to collect results
+results_list <- list()
+
+# Loop through significant environmental variables
+for (var in significant_vars) {
+  if (var %in% rownames(env_vectors)) {
+    var_vector <- env_vectors[var, ]  # Coordinates of the environmental variable
+    
+    # Compute cosine similarity (correlation in ordination space)
+    correlations <- apply(species_scores, 1, function(x) {
+      sum(x * var_vector) / (sqrt(sum(x^2)) * sqrt(sum(var_vector^2)))
+    })
+    
+    # Filter strongly positively correlated species (> 0.7)
+    strong_positive <- correlations[correlations > 0.7]
+    
+    if (length(strong_positive) > 0) {
+      # Create tibble for this variable
+      df <- tibble(
+        variable = var,
+        ASV = names(strong_positive),
+        correlation = as.numeric(strong_positive)
+      )
+      
+      # Store in list
+      results_list[[var]] <- df
+    }
+  }
+}
+
+# Combine all into one tibble
+strong_positive_species_tibble <- bind_rows(results_list)
+
+# View result
+strong_positive_species_tibble
+
+strong_positive_species_tibble %>% 
+  group_by(variable) %>% 
+  arrange(desc(correlation), .by_group = T) %>% 
+  inner_join(.,
+             tax_table(physeq_core50prev_0.01abund_genus) %>% 
+               data.frame() %>% as_tibble() %>% 
+               mutate(ASV = taxa_names(physeq_core50prev_0.01abund_genus)),
+             by = "ASV") %>% 
+  inner_join(.,
+             psmelt(tax_glom(physeq2_clean, taxrank =  "Genus") %>% transform_sample_counts(., function(x) x/sum(x)*100)) %>% 
+               as_tibble() %>% select(ASV = "OTU", Sample, Abundance) %>% 
+               group_by(ASV) %>% 
+               summarise(max_abund = max(Abundance)),
+             by = "ASV") %>% 
+  select(-Species) %>% 
+  write_csv(glue("output_data/{proj}_Cosine_similarity_correlations_CAP_genus_vs_env_variables.csv"))
+  
+
+library(ggrepel) 
+# Plot
+cap_plot <- ggplot() +
+  geom_hline(yintercept = 0, color = "grey90") +
+  geom_vline(xintercept = 0, color = "grey90") +
+
+  # Samples
+  geom_point(data = sites_df,
+             aes(x = CAP1, y = CAP2, fill = date),
+             shape = 21, size = 3) +
+  scale_fill_date() +
+  
+  # Species (functional groups)
+  # geom_point(data = 
+  #              species_df %>% 
+  #              filter(ASV %in% (strong_positive_species_tibble %>% 
+  #              filter(variable == "total_fe_g_kg_ts_secondary_sludge_v08") %>% select(-variable) %>% pull(ASV))),
+  #            aes(x = CAP1, y = CAP2),
+  #            size = 2, color = "grey70") +
+  
+  # # Species (a priori species with functional groups)
+  # geom_point(data = 
+  #              species_df %>% 
+  #              filter(functional_group != "other"),
+  #            aes(x = CAP1, y = CAP2, color = functional_group, shape = functional_group),
+  #            size = 2) +
+  
+  # Environmental arrows
+  geom_segment(data = env_df,
+               aes(x = 0, y = 0, xend = CAP1 * 0.8, yend = CAP2 * 0.8),
+               arrow = arrow(length = unit(0.2, "cm")), color = "darkred") +
+
+  # Labels for environmental variables
+  geom_text_repel(data = env_df,
+                  aes(x = CAP1 * 0.9, y = CAP2 * 0.9, label = variable),
+                  color = "darkred", size = 3) +
+  # geom_text_repel(data = 
+  #              species_df %>% 
+  #              filter(ASV %in% (strong_positive_species_tibble %>% 
+  #              filter(variable == "total_fe_g_kg_ts_secondary_sludge_v08") %>% select(-variable) %>% pull(ASV))),
+  #            aes(x = CAP1, y = CAP2, label = if_else(CAP1 > 0.05, Genus, NA_character_)),
+  #            size = 2.5, color = "grey70", show.legend = F, hjust = 0) +
+  # Labels for species (optional, skip "other" to avoid clutter)
+  # geom_text_repel(data = species_df %>% filter(functional_group != "other"),
+  #                 aes(x = CAP1, y = CAP2, label = Genus, color = functional_group),
+  #                 size = 2.5, show.legend = FALSE) +
+
+  labs(x = axis1_label, y = axis2_label,
+       title = "Constrained Ordination (CAP)") +
+
+  theme_minimal() +
+  theme(panel.border = element_rect(color = "black", fill = NA),
+        axis.line = element_line(color = "black"),
+        legend.position = "right") +
+  scale_color_manual(values = c(brewer.pal(8, "Dark2"))) +
+  ggrepel::geom_text_repel(data = sites_df %>% as_tibble() %>% mutate(date = as.character(date)),
+                           aes(x = CAP1, y = CAP2, label = date), color = "black", size = 2)
+
+  
+
+print(cap_plot)
+# Save
+ggsave(plot = cap_plot,
+       filename = glue("figures/{proj}_CAP_genus_BC_species_env.pdf"),
+       width = 8, height = 6)
+
+
+```
+
+
+
+
+```{r test correlations CAP}
+
+test_corr = physeq_core50prev_0.01abund_genus %>% 
+  transform_sample_counts(., function(x) x/sum(x)) %>% 
+  psmelt()
+
+
+test_corr %>% 
+  inner_join(., env_data, by = c("sampleID", "date")) %>% 
+  filter(Genus == "Genus of PeM15") %>% 
+  as_tibble() %>% 
+  ggplot(aes(x = temp_tank, y = Abundance, color = date)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F) +
+  scale_color_date() +
+  ggpubr::stat_cor(method = "spearman", cor.coef.name = "rho") +
+  ggtitle("Example of Genus of PeM15 abundance vs tank temperature") +
+  theme_light() 
+  
+
+```
+
+

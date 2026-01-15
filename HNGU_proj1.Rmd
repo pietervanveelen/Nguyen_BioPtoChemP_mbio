@@ -369,6 +369,7 @@ plots <-
   theme(axis.text.x = element_text(angle = 60, hjust = 1),
         legend.position = "bottom")
 
+print(plots)
 
 ggsave(plot = plots, filename = glue("figures/{proj}_plot_barplot_genus_core50prev_0.01abund.pdf"), width = 13, height =8)
 
@@ -886,23 +887,24 @@ ggsave(plot = cap_plot,
 
 
 
-```{r test correlations CAP}
+```{r test correlations clr}
 
-test_corr = physeq_core50prev_0.01abund_genus %>% 
-  transform_sample_counts(., function(x) x/sum(x)) %>% 
+test_corr = 
+  physeq_core50prev_0.01abund_genus %>% 
+  microbiome::transform(transform = "clr") %>% 
   psmelt()
 
 
 test_corr %>% 
   inner_join(., env_data, by = c("sampleID", "date")) %>% 
-  filter(Genus == "Genus of PeM15") %>% 
+  filter(Genus == "Candidatus_Microthrix") %>% 
   as_tibble() %>% 
-  ggplot(aes(x = temp_tank, y = Abundance, color = date)) +
+  ggplot(aes(x = total_fe_g_kg_sludge_secondary_sludge_v08, y = Abundance, color = date)) +
   geom_point() +
   geom_smooth(method = "lm", se = F) +
   scale_color_date() +
-  ggpubr::stat_cor(method = "spearman", cor.coef.name = "rho") +
-  ggtitle("Example of Genus of PeM15 abundance vs tank temperature") +
+  ggpubr::stat_cor(method = "pearson", cor.coef.name = "r") +
+  ggtitle("Example of Candidatus_Microthrix abundance vs Fe dosed") +
   theme_light() 
   
 

@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1134345422.svg)](https://doi.org/10.5281/zenodo.20613298)
 This repository documents the microbial community analysis reported by H Nguyen et al.
 
 <b>Full-Scale Conversion of Wastewater Treatment Plant from Biological to Chemical Phosphorus Removal for Vivianite Formation</b>

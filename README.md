@@ -1,4 +1,4 @@
-This repository documents the microbial community analysis reported by H Nguyen
+This repository documents the microbial community analysis reported by H Nguyen et al.
 
 <b>Full-Scale Conversion of Wastewater Treatment Plant from Biological to Chemical Phosphorus Removal for Vivianite Formation</b>
 
